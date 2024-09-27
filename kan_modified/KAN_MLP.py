@@ -318,12 +318,12 @@ class KANLayer_efficient(torch.nn.Module):
         )
 
     def to(self, device):
-        super(KANLayer_efficient, self).to(device)
+        super().to(device)
         self.device = device
         return self
 
 
-class KAN_Linear(torch.nn.Module):
+class BaseKAN(torch.nn.Module):
     '''
     KAN with the first layer being a nn.Linear
     '''
@@ -337,23 +337,13 @@ class KAN_Linear(torch.nn.Module):
             scale_base=0.0,
             scale_spline=1.0,
             base_fun='silu',
-            # symbolic_enabled=True,
-            # affine_trainable=False,
             grid_eps=0.02,
             grid_range=[-1, 1],
-            # sp_trainable=True,
-            # sb_trainable=True,
             seed=1,
             save_act=True,
-            # sparse_init=False,
-            # auto_save=True,
-            # first_init=True,
-            # ckpt_path='./model',
-            # state_id=0,
-            # round=0,
             device='cpu'
     ):
-        super(KAN_Linear, self).__init__()
+        super().__init__()
 
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -376,9 +366,6 @@ class KAN_Linear(torch.nn.Module):
             self.mult_homo = False # when home if False, for loop is required.
         self.mult_arity = mult_arity
 
-        width_in = self.width_in
-        width_out = self.width_out
-
         self.base_fun_name = base_fun
         if base_fun == 'silu':
             base_fun = torch.nn.SiLU()
@@ -387,48 +374,26 @@ class KAN_Linear(torch.nn.Module):
         elif base_fun == 'zero':
             base_fun = lambda x: x*0.
 
-        self.grid_eps = grid_eps
-        self.grid_range = grid_range
-
         self.layers = torch.nn.ModuleList()
-        # The first layer is a Linear layer
-        l = 0
-        self.layers.append(
-            torch.nn.Linear(
-                in_features=width_in[l],
-                out_features=width_out[l+1],
-                bias=True,
-                # device=device,
-            )
-        )
-        # The rest of the layers are KAN layers
-        for l in range(1, self.depth):
-            self.layers.append(
-                KANLayer_efficient(
-                    in_features=width_in[l],
-                    out_features=width_out[l+1],
-                    grid_size=grid_size,
-                    spline_order=spline_order,
-                    scale_noise=scale_noise,
-                    scale_base=scale_base,
-                    scale_spline=scale_spline,
-                    base_activation=base_fun,
-                    grid_eps=grid_eps,
-                    grid_range=grid_range,
-                )
-            )
 
         self.grid_size = grid_size
         self.spline_order = spline_order
+        self.scale_noise=scale_noise
+        self.scale_base=scale_base
+        self.scale_spline=scale_spline
         self.base_fun = base_fun
-        # self.layer_types = layer_types
+        self.grid_eps = grid_eps
+        self.grid_range = grid_range
 
         self.device = device
         self.to(device)
 
+    def _create_layers(self):
+        raise NotImplementedError('Layers must be defined in the subclasses.')
+
     def to(self, device):
         self.device = device
-        super(KAN_Linear, self).to(device)
+        super().to(device)
         for layer in self.layers:
             layer.to(device)
         return self
@@ -560,8 +525,9 @@ class KAN_Linear(torch.nn.Module):
     #         for layer in self.layers
     #     )
 
-    def l1_regularization(self, layer):
-        return layer.weight.abs().sum()
+    def regularization_loss(self, **kwargs):
+        # Default implementation (no-op) — subclasses can override this
+        return torch.tensor(0.0, requires_grad=True)
 
     def fit(
         self,
@@ -569,10 +535,10 @@ class KAN_Linear(torch.nn.Module):
         valid_loader,
         loss_fn,
         optimizer,
-        num_epochs=25,
+        num_epochs=10,
         update_grid=True,
         device='cpu',
-        l1_lambda=0.0,
+        **kwargs
     ):
 
         self.to(device)
@@ -582,7 +548,7 @@ class KAN_Linear(torch.nn.Module):
             # Set model to training mode
             self.train()
             running_loss = 0.0
-            total_train = 0
+            ct_train = 0
 
             # Training loop with progress bar
             train_loop = tqdm(
@@ -591,19 +557,24 @@ class KAN_Linear(torch.nn.Module):
                 leave=False,
                 ncols=100)
 
-            for inputs, labels in train_loop:
+            for i, (inputs, labels) in enumerate(train_loop):
                 inputs, labels = inputs.to(device), labels.to(device)
 
                 # Zero the gradients
                 optimizer.zero_grad()
 
                 # Forward pass
-                outputs = self.forward(inputs, update_grid=update_grid)
+                if i == len(train_loader)-2 and update_grid:
+                    # Updates grid at the second last batch of the epoch
+                    # Second last because the last batch might be too small
+                    outputs = self.forward(inputs, update_grid=True)
+                else:
+                    outputs = self.forward(inputs, update_grid=False)
                 loss = loss_fn(outputs, labels)
 
-                # Regularization loss
-                l1_reg = l1_lambda * self.l1_regularization(self.layers[0])
-                loss += l1_reg
+                # Custom regularization loss
+                reg_loss = self.regularization_loss(**kwargs)
+                loss += reg_loss
 
                 # Backward pass and optimize
                 loss.backward()
@@ -612,20 +583,20 @@ class KAN_Linear(torch.nn.Module):
                 # Accumulate the loss
                 batch_size = inputs.size(0)
                 running_loss += loss.item() * batch_size
-                total_train += batch_size
+                ct_train += batch_size
 
                 # Update progress bar
-                train_loss = running_loss / total_train
+                train_loss = running_loss / ct_train
                 # train_loop.set_postfix({'loss': f'{train_loss:.4f}'})
                 train_loop.set_description(
                     f'Epoch [{epoch+1}/{num_epochs}] Training '
-                    f'| loss: {train_loss:.4f} | reg: {l1_reg:.4f}'
+                    f'| loss: {train_loss:.4f} | reg: {reg_loss:.4f}'
                 )
 
             # Validation phase
             self.eval()  # Set model to evaluation mode
             valid_loss = 0.0
-            total_valid = 0
+            ct_valid = 0
 
             with torch.no_grad():  # No need to compute gradients during validation
                 valid_loop = tqdm(
@@ -644,15 +615,15 @@ class KAN_Linear(torch.nn.Module):
                     # Accumulate validation loss
                     batch_size = inputs.size(0)
                     valid_loss += loss.item() * batch_size
-                    total_valid += batch_size
+                    ct_valid += batch_size
 
                     # Update progress bar
-                    valid_loss_avg = valid_loss / total_valid
+                    valid_loss_avg = valid_loss / ct_valid
                     valid_loop.set_postfix({'val_loss': f'{valid_loss_avg:.4f}'})
 
             # Calculate average training and validation loss
-            train_loss = running_loss / total_train
-            valid_loss /= total_valid
+            train_loss = running_loss / ct_train
+            valid_loss /= ct_valid
             losses['train'].append(math.sqrt(train_loss))
             losses['valid'].append(math.sqrt(valid_loss))
 
@@ -664,3 +635,121 @@ class KAN_Linear(torch.nn.Module):
         print("Training complete.")
 
         return losses
+
+
+class KAN_Linear(BaseKAN):
+    '''
+    KAN with the first layer being a nn.Linear
+    '''
+    def __init__(
+        self,
+        width,
+        grid_size=3,
+        spline_order=3,
+        mult_arity=2,
+        scale_noise=0.1,
+        scale_base=0.0,
+        scale_spline=1.0,
+        base_fun='silu',
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+        seed=1,
+        save_act=True,
+        device='cpu'
+    ):
+        super().__init__(
+            width=width,
+            grid_size=grid_size,
+            spline_order=spline_order,
+            mult_arity=mult_arity,
+            scale_noise=scale_noise,
+            scale_base=scale_base,
+            scale_spline=scale_spline,
+            base_fun=base_fun,
+            grid_eps=grid_eps,
+            grid_range=grid_range,
+            seed=seed,
+            save_act=save_act,
+            device=device
+        )
+        self._create_layers()
+
+    def _create_layers(self):
+        # The first layer is a linear layer
+        l = 0
+        self.layers.append(
+            torch.nn.Linear(
+                in_features=self.width_in[l],
+                out_features=self.width_out[l+1],
+                bias=True
+            )
+        )
+        # The rest of the layers are KAN layers
+        for l in range(1, self.depth):
+            self.layers.append(
+                KANLayer_efficient(
+                    in_features=self.width_in[l],
+                    out_features=self.width_out[l+1],
+                    grid_size=self.grid_size,
+                    spline_order=self.spline_order,
+                    scale_noise=self.scale_noise,
+                    scale_base=self.scale_base,
+                    scale_spline=self.scale_spline,
+                    base_activation=self.base_fun,
+                    grid_eps=self.grid_eps,
+                    grid_range=self.grid_range,
+                )
+            )
+
+    def fit(
+        self,
+        train_loader,
+        valid_loader,
+        loss_fn,
+        optimizer,
+        num_epochs=10,
+        update_grid=True,
+        device='cpu',
+        l1_lambda=0.0,
+        ortho_lambda=0.0,
+    ):
+        losses = super().fit(
+            train_loader,
+            valid_loader,
+            loss_fn,
+            optimizer,
+            num_epochs,
+            update_grid,
+            device,
+            l1_lambda=l1_lambda,
+            ortho_lambda=ortho_lambda
+        )
+        return losses
+
+    def regularization_loss(self, l1_lambda=0.0, ortho_lambda=0.0):
+        # Computer l1 reg for all linear layers
+        l1_reg = 0.0
+        if l1_lambda > 0:
+            for layer in self.layers:
+                if isinstance(layer, torch.nn.Linear):
+                    l1_reg += self.l1_regularization(layer)
+
+        # Compute orthogonality reg for the first linear layer
+        ortho_reg = 0.0
+        if ortho_lambda > 0:
+            layer = self.layers[0]
+            assert isinstance(layer, torch.nn.Linear)
+            weights = layer.weight
+
+            # # 1) Strict, sensitive to the magnitude
+            # wt_w = torch.mm(weights, weights.t())
+            # identity = torch.eye(wt_w.size(0)).to(weights.device)
+            # ortho_reg = torch.norm(wt_w - identity, p='fro')  # Frobenius
+
+            # 2) Focuses purely on the direction
+            w_normalized = F.normalize(weights, p=2, dim=1)
+            wt_w = torch.mm(w_normalized, w_normalized.t())
+            mask = torch.eye(wt_w.size(0), device=weights.device)
+            ortho_reg = torch.sum(torch.abs(wt_w * (1 - mask)))
+
+        return (l1_lambda * l1_reg) + (ortho_lambda * ortho_reg)
