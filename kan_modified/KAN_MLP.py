@@ -1,326 +1,19 @@
 import torch
-# import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-# from .KANLayer import KANLayer
-from .Symbolic_KANLayer import Symbolic_KANLayer
-from .LBFGS import *
-import os
-import glob
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import random
-import copy
-import pandas as pd
-from sympy.printing import latex
-from sympy import *
-import sympy
-import yaml
 import math
-from .spline import curve2coef
-from .utils import SYMBOLIC_LIB
-from .hypothesis import plot_tree
 
+
+from .LBFGS import *
+from .KANLayer2 import KANLayer_efficient, KANLayer_original
+# from .Symbolic_KANLayer import Symbolic_KANLayer
 # from .MultKAN import MultKAN
 
-# https://github.com/Blealtan/efficient-kan/blob/master/src/efficient_kan/kan.py
-class KANLayer_efficient(torch.nn.Module):
 
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        grid_size=5,
-        spline_order=3,
-        scale_noise=0.1,
-        scale_base=1.0,
-        scale_spline=1.0,
-        enable_standalone_scale_spline=True,
-        base_activation=torch.nn.SiLU,
-        grid_eps=0.02,
-        grid_range=[-1, 1],
-    ):
-        super(KANLayer_efficient, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.grid_size = grid_size
-        self.spline_order = spline_order
-
-        h = (grid_range[1] - grid_range[0]) / grid_size
-        grid = (
-            (
-                torch.arange(-spline_order, grid_size + spline_order + 1) * h
-                + grid_range[0]
-            )
-            .expand(in_features, -1)
-            .contiguous()
-        )
-        self.register_buffer("grid", grid)
-
-        self.base_weight = torch.nn.Parameter(torch.Tensor(out_features, in_features))
-        self.spline_weight = torch.nn.Parameter(
-            torch.Tensor(out_features, in_features, grid_size + spline_order)
-        )
-        if enable_standalone_scale_spline:
-            self.spline_scaler = torch.nn.Parameter(
-                torch.Tensor(out_features, in_features)
-            )
-
-        self.scale_noise = scale_noise
-        self.scale_base = scale_base
-        self.scale_spline = scale_spline
-        self.enable_standalone_scale_spline = enable_standalone_scale_spline
-        self.base_activation = base_activation()
-        self.grid_eps = grid_eps
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
-        with torch.no_grad():
-            noise = (
-                (
-                    torch.rand(self.grid_size + 1, self.in_features, self.out_features)
-                    - 1 / 2
-                )
-                * self.scale_noise
-                / self.grid_size
-            )
-            self.spline_weight.data.copy_(
-                (self.scale_spline if not self.enable_standalone_scale_spline else 1.0)
-                * self.curve2coeff(
-                    self.grid.T[self.spline_order : -self.spline_order],
-                    noise,
-                )
-            )
-            if self.enable_standalone_scale_spline:
-                # torch.nn.init.constant_(self.spline_scaler, self.scale_spline)
-                torch.nn.init.kaiming_uniform_(self.spline_scaler, a=math.sqrt(5) * self.scale_spline)
-
-    def b_splines(self, x: torch.Tensor):
-        """
-        Compute the B-spline bases for the given input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-
-        Returns:
-            torch.Tensor: B-spline bases tensor of shape (batch_size, in_features, grid_size + spline_order).
-        """
-        assert x.dim() == 2 and x.size(1) == self.in_features
-
-        grid: torch.Tensor = (
-            self.grid
-        )  # (in_features, grid_size + 2 * spline_order + 1)
-        x = x.unsqueeze(-1)
-        bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
-        for k in range(1, self.spline_order + 1):
-            bases = (
-                (x - grid[:, : -(k + 1)])
-                / (grid[:, k:-1] - grid[:, : -(k + 1)])
-                * bases[:, :, :-1]
-            ) + (
-                (grid[:, k + 1 :] - x)
-                / (grid[:, k + 1 :] - grid[:, 1:(-k)])
-                * bases[:, :, 1:]
-            )
-
-        assert bases.size() == (
-            x.size(0),
-            self.in_features,
-            self.grid_size + self.spline_order,
-        )
-        return bases.contiguous()
-
-    def curve2coeff(self, x: torch.Tensor, y: torch.Tensor):
-        """
-        Compute the coefficients of the curve that interpolates the given points.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-            y (torch.Tensor): Output tensor of shape (batch_size, in_features, out_features).
-
-        Returns:
-            torch.Tensor: Coefficients tensor of shape (out_features, in_features, grid_size + spline_order).
-        """
-        assert x.dim() == 2 and x.size(1) == self.in_features
-        assert y.size() == (x.size(0), self.in_features, self.out_features)
-
-        A = self.b_splines(x).transpose(
-            0, 1
-        )  # (in_features, batch_size, grid_size + spline_order)
-        B = y.transpose(0, 1)  # (in_features, batch_size, out_features)
-        solution = torch.linalg.lstsq(
-            A, B
-        ).solution  # (in_features, grid_size + spline_order, out_features)
-        result = solution.permute(
-            2, 0, 1
-        )  # (out_features, in_features, grid_size + spline_order)
-
-        assert result.size() == (
-            self.out_features,
-            self.in_features,
-            self.grid_size + self.spline_order,
-        )
-        return result.contiguous()
-
-    @property
-    def scaled_spline_weight(self):
-        return self.spline_weight * (
-            self.spline_scaler.unsqueeze(-1)
-            if self.enable_standalone_scale_spline
-            else 1.0
-        )
-
-    def forward(self, x: torch.Tensor):
-        assert x.size(-1) == self.in_features
-        original_shape = x.shape
-        x = x.reshape(-1, self.in_features)
-
-        base_output = F.linear(self.base_activation(x), self.base_weight)
-        spline_output = F.linear(
-            self.b_splines(x).view(x.size(0), -1),
-            self.scaled_spline_weight.view(self.out_features, -1),
-        )
-        output = base_output + spline_output
-
-        output = output.reshape(*original_shape[:-1], self.out_features)
-
-        return output
-
-    def get_activations(self, x: torch.Tensor, save_act=True):
-        '''
-        KANLayer forward given input x
-        Essentially the same as foward but with the option to save feature-wise activations
-
-        Args:
-        -----
-            x : 2D torch.float
-                inputs, shape (batch_size, in_features)
-
-        Returns:
-        --------
-            output : 2D torch.float
-                outputs, shape (batch_size, out_features)
-            preacts : 3D torch.float
-                inputs expanded for each output feature, shape (batch_size, out_features, in_features)
-            postacts : 3D torch.float
-                per-feature contributions to the output, shape (batch_size, out_features, in_features)
-            postspline : 3D torch.float
-                per-feature spline contributions, shape (batch_size, out_features, in_features)
-        '''
-        assert x.size(-1) == self.in_features
-        original_shape = x.shape
-        x = x.reshape(-1, self.in_features)
-        batch_size = x.size(0)
-
-        # Compute base activation
-        base_activation = self.base_activation(x)  # Shape: (batch_size, in_features)
-
-        # Compute per-feature base contributions
-        base_weight_expanded = self.base_weight.unsqueeze(0)  # Shape: (1, out_features, in_features)
-        base_activation_expanded = base_activation.unsqueeze(1)  # Shape: (batch_size, 1, in_features)
-        base_output_contributions = base_activation_expanded * base_weight_expanded  # Shape: (batch_size, out_features, in_features)
-        base_output = base_output_contributions.sum(dim=2)  # Shape: (batch_size, out_features)
-
-        # Compute B-spline activations
-        b_spline_vals = self.b_splines(x)  # Shape: (batch_size, in_features, n_spline_coeffs)
-
-        # Compute per-feature spline contributions
-        scaled_spline_weight = self.scaled_spline_weight  # Shape: (out_features, in_features, n_spline_coeffs)
-        spline_output_contributions = torch.einsum('bik,oik->boi', b_spline_vals, scaled_spline_weight)  # Shape: (batch_size, out_features, in_features)
-        spline_output = spline_output_contributions.sum(dim=2)  # Shape: (batch_size, out_features)
-
-        # Total per-feature contributions
-        total_output_contributions = base_output_contributions + spline_output_contributions  # Shape: (batch_size, out_features, in_features)
-
-        # Final output
-        output = base_output + spline_output  # Shape: (batch_size, out_features)
-        output = output.reshape(*original_shape[:-1], self.out_features)
-
-        if save_act:
-            preacts = x.unsqueeze(1).expand(batch_size, self.out_features, self.in_features)  # Shape: (batch_size, out_features, in_features)
-            postacts = total_output_contributions  # Shape: (batch_size, out_features, in_features)
-            postspline = spline_output_contributions  # Shape: (batch_size, out_features, in_features)
-            return output, preacts, postacts, postspline
-
-        return output
-
-    @torch.no_grad()
-    def update_grid(self, x: torch.Tensor, margin=0.01):
-        assert x.dim() == 2 and x.size(1) == self.in_features
-        batch = x.size(0)
-
-        splines = self.b_splines(x)  # (batch, in, coeff)
-        splines = splines.permute(1, 0, 2)  # (in, batch, coeff)
-        orig_coeff = self.scaled_spline_weight  # (out, in, coeff)
-        orig_coeff = orig_coeff.permute(1, 2, 0)  # (in, coeff, out)
-        unreduced_spline_output = torch.bmm(splines, orig_coeff)  # (in, batch, out)
-        unreduced_spline_output = unreduced_spline_output.permute(
-            1, 0, 2
-        )  # (batch, in, out)
-
-        # sort each channel individually to collect data distribution
-        x_sorted = torch.sort(x, dim=0)[0]
-        grid_adaptive = x_sorted[
-            torch.linspace(
-                0, batch - 1, self.grid_size + 1, dtype=torch.int64, device=x.device
-            )
-        ]
-
-        uniform_step = (x_sorted[-1] - x_sorted[0] + 2 * margin) / self.grid_size
-        grid_uniform = (
-            torch.arange(
-                self.grid_size + 1, dtype=torch.float32, device=x.device
-            ).unsqueeze(1)
-            * uniform_step
-            + x_sorted[0]
-            - margin
-        )
-
-        grid = self.grid_eps * grid_uniform + (1 - self.grid_eps) * grid_adaptive
-        grid = torch.concatenate(
-            [
-                grid[:1]
-                - uniform_step
-                * torch.arange(self.spline_order, 0, -1, device=x.device).unsqueeze(1),
-                grid,
-                grid[-1:]
-                + uniform_step
-                * torch.arange(1, self.spline_order + 1, device=x.device).unsqueeze(1),
-            ],
-            dim=0,
-        )
-
-        self.grid.copy_(grid.T)
-        self.spline_weight.data.copy_(self.curve2coeff(x, unreduced_spline_output))
-
-    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
-        """
-        Compute the regularization loss.
-
-        This is a dumb simulation of the original L1 regularization as stated in the
-        paper, since the original one requires computing absolutes and entropy from the
-        expanded (batch, in_features, out_features) intermediate tensor, which is hidden
-        behind the F.linear function if we want an memory efficient implementation.
-
-        The L1 regularization is now computed as mean absolute value of the spline
-        weights. The authors implementation also includes this term in addition to the
-        sample-based regularization.
-        """
-        l1_fake = self.spline_weight.abs().mean(-1)
-        regularization_loss_activation = l1_fake.sum()
-        p = l1_fake / regularization_loss_activation
-        regularization_loss_entropy = -torch.sum(p * p.log())
-        return (
-            regularize_activation * regularization_loss_activation
-            + regularize_entropy * regularization_loss_entropy
-        )
-
-    def to(self, device):
-        super().to(device)
-        self.device = device
-        return self
+KANLayer = [KANLayer_original, KANLayer_efficient][0]
 
 
 class BaseKAN(torch.nn.Module):
@@ -340,7 +33,7 @@ class BaseKAN(torch.nn.Module):
             grid_eps=0.02,
             grid_range=[-1, 1],
             seed=1,
-            save_act=True,
+            # save_act=True,
             device='cpu'
     ):
         super().__init__()
@@ -353,7 +46,7 @@ class BaseKAN(torch.nn.Module):
         self.depth = len(width) - 1
 
         for i in range(len(width)):
-            if type(width[i]) == int:
+            if isinstance(width[i], int):
                 width[i] = [width[i],0]
         self.width = width
 
@@ -413,7 +106,7 @@ class BaseKAN(torch.nn.Module):
         The number of output subnodes for each layer
         '''
         width = self.width
-        if self.mult_homo == True:
+        if self.mult_homo is True:
             width_out = [width[l][0]+self.mult_arity*width[l][1] for l in range(len(width))]
         else:
             width_out = [width[l][0]+int(np.sum(self.mult_arity[l])) for l in range(len(width))]
@@ -445,7 +138,7 @@ class BaseKAN(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, update_grid=False):
         for layer in self.layers:
-            if isinstance(layer, KANLayer_efficient) and update_grid:
+            if isinstance(layer, KANLayer) and update_grid:
                 layer.update_grid(x)
             x = layer(x)
         return x
@@ -457,7 +150,7 @@ class BaseKAN(torch.nn.Module):
         self.preacts = []
         self.postacts = []
         for layer in self.layers:
-            if isinstance(layer, KANLayer_efficient):
+            if isinstance(layer, KANLayer):
                 x, preacts, postacts, _ = layer.get_activations(x)
                 self.preacts.append(preacts)
                 self.postacts.append(postacts)
@@ -493,7 +186,7 @@ class BaseKAN(torch.nn.Module):
         '''
         Plot all the activation functions for layer l
         '''
-        assert isinstance(self.layers[l], KANLayer_efficient), \
+        assert isinstance(self.layers[l], KANLayer), \
             f'layer {l} is not a KAN layer.'
 
         ncols = self.layers[l].in_features
@@ -550,6 +243,12 @@ class BaseKAN(torch.nn.Module):
             running_loss = 0.0
             ct_train = 0
 
+            ### Define the frequency of updating the grid
+            n_freq = 5
+            update_grid_now = update_grid and (epoch + 1) % n_freq == 0
+            if update_grid_now:
+                print(f'epoch {epoch+1}: update grid')
+
             # Training loop with progress bar
             train_loop = tqdm(
                 train_loader,
@@ -564,9 +263,7 @@ class BaseKAN(torch.nn.Module):
                 optimizer.zero_grad()
 
                 # Forward pass
-                if i == len(train_loader)-2 and update_grid:
-                    # Updates grid at the second last batch of the epoch
-                    # Second last because the last batch might be too small
+                if i == 0 and update_grid_now:
                     outputs = self.forward(inputs, update_grid=True)
                 else:
                     outputs = self.forward(inputs, update_grid=False)
@@ -594,11 +291,11 @@ class BaseKAN(torch.nn.Module):
                 )
 
             # Validation phase
-            self.eval()  # Set model to evaluation mode
+            self.eval()
             valid_loss = 0.0
             ct_valid = 0
 
-            with torch.no_grad():  # No need to compute gradients during validation
+            with torch.no_grad():
                 valid_loop = tqdm(
                     valid_loader,
                     desc=f'Epoch [{epoch+1}/{num_epochs}] Validation',
@@ -624,8 +321,8 @@ class BaseKAN(torch.nn.Module):
             # Calculate average training and validation loss
             train_loss = running_loss / ct_train
             valid_loss /= ct_valid
-            losses['train'].append(math.sqrt(train_loss))
-            losses['valid'].append(math.sqrt(valid_loss))
+            losses['train'].append(train_loss**(1/2))
+            losses['valid'].append(valid_loss**(1/2))
 
             # Print statistics for the epoch
             print(f'Epoch [{epoch+1}/{num_epochs}], '
@@ -637,7 +334,7 @@ class BaseKAN(torch.nn.Module):
         return losses
 
 
-class KAN_Linear(BaseKAN):
+class LinearKAN(BaseKAN):
     '''
     KAN with the first layer being a nn.Linear
     '''
@@ -654,7 +351,6 @@ class KAN_Linear(BaseKAN):
         grid_eps=0.02,
         grid_range=[-1, 1],
         seed=1,
-        save_act=True,
         device='cpu'
     ):
         super().__init__(
@@ -669,7 +365,6 @@ class KAN_Linear(BaseKAN):
             grid_eps=grid_eps,
             grid_range=grid_range,
             seed=seed,
-            save_act=save_act,
             device=device
         )
         self._create_layers()
@@ -687,7 +382,7 @@ class KAN_Linear(BaseKAN):
         # The rest of the layers are KAN layers
         for l in range(1, self.depth):
             self.layers.append(
-                KANLayer_efficient(
+                KANLayer(
                     in_features=self.width_in[l],
                     out_features=self.width_out[l+1],
                     grid_size=self.grid_size,
@@ -711,7 +406,9 @@ class KAN_Linear(BaseKAN):
         update_grid=True,
         device='cpu',
         l1_lambda=0.0,
+        group_lambda=0.0,
         ortho_lambda=0.0,
+        kan_lambda=0.0,
     ):
         losses = super().fit(
             train_loader,
@@ -722,19 +419,38 @@ class KAN_Linear(BaseKAN):
             update_grid,
             device,
             l1_lambda=l1_lambda,
-            ortho_lambda=ortho_lambda
+            group_lambda=group_lambda,
+            ortho_lambda=ortho_lambda,
+            kan_lambda=kan_lambda,
         )
         return losses
 
-    def regularization_loss(self, l1_lambda=0.0, ortho_lambda=0.0):
-        # Computer l1 reg for all linear layers
+    def regularization_loss(
+        self,
+        l1_lambda=0.0,
+        group_lambda=0.0,
+        ortho_lambda=0.0,
+        kan_lambda=0.0,
+    ):
+        # L1 regularization for all linear layers
         l1_reg = 0.0
         if l1_lambda > 0:
             for layer in self.layers:
                 if isinstance(layer, torch.nn.Linear):
-                    l1_reg += self.l1_regularization(layer)
+                    l1_reg += l1_lambda * torch.norm(layer.weight, p=1)
+            l1_reg *= l1_lambda
 
-        # Compute orthogonality reg for the first linear layer
+        # Group lasso regularzation
+        group_reg = 0.0
+        if group_lambda > 0:
+            # for name, param in self.named_parameters():
+            #     if 'weight' in name:
+            #         group_reg += group_lambda * torch.norm(param, p=2)
+            for weights in self.layers[0].weight:
+                group_reg += torch.norm(weights, p=2)
+            group_reg *= group_lambda
+
+        # Orthogonality regularization for the first linear layer
         ortho_reg = 0.0
         if ortho_lambda > 0:
             layer = self.layers[0]
@@ -752,4 +468,15 @@ class KAN_Linear(BaseKAN):
             mask = torch.eye(wt_w.size(0), device=weights.device)
             ortho_reg = torch.sum(torch.abs(wt_w * (1 - mask)))
 
-        return (l1_lambda * l1_reg) + (ortho_lambda * ortho_reg)
+            ortho_reg *= ortho_lambda
+
+        # KAN l1 regularization
+        kan_reg = 0.0
+        if kan_lambda > 0:
+            for layer in self.layers:
+                if isinstance(layer, KANLayer):
+                    # lambda_act = 1.0, lambda_entropy = 1.0 by default
+                    kan_reg += layer.regularization_loss()
+            kan_reg *= kan_lambda
+
+        return l1_reg + group_reg + ortho_reg + kan_reg
