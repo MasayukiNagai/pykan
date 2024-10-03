@@ -4,8 +4,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import random
-import math
-
 
 from .LBFGS import *
 from .KANLayer2 import KANLayer_efficient, KANLayer_original
@@ -136,11 +134,19 @@ class BaseKAN(torch.nn.Module):
         '''
         self.update_grid_from_samples(x)
 
-    def forward(self, x: torch.Tensor, update_grid=False):
+    def forward(self, x: torch.Tensor, update_grid=False, save_act=False):
         for layer in self.layers:
+            # Update grid for KAN layers
             if isinstance(layer, KANLayer) and update_grid:
                 layer.update_grid(x)
+
+            # Forward pass
             x = layer(x)
+
+            # Save activation values
+            if save_act:
+                self.activations.append(x)
+
         return x
 
     def get_activations(self, x):
@@ -230,6 +236,7 @@ class BaseKAN(torch.nn.Module):
         optimizer,
         num_epochs=10,
         update_grid=True,
+        save_act=True,
         device='cpu',
         **kwargs
     ):
@@ -245,8 +252,8 @@ class BaseKAN(torch.nn.Module):
 
             ### Define the frequency of updating the grid
             n_freq = 5
-            update_grid_now = update_grid and (epoch + 1) % n_freq == 0
-            if update_grid_now:
+            update_grid_epoch = update_grid and (epoch + 1) % n_freq == 0
+            if update_grid_epoch:
                 print(f'epoch {epoch+1}: update grid')
 
             # Training loop with progress bar
@@ -263,10 +270,13 @@ class BaseKAN(torch.nn.Module):
                 optimizer.zero_grad()
 
                 # Forward pass
-                if i == 0 and update_grid_now:
-                    outputs = self.forward(inputs, update_grid=True)
-                else:
-                    outputs = self.forward(inputs, update_grid=False)
+                self.activations = []
+                update_grid_now = update_grid_epoch and i == 0
+
+                outputs = self.forward(
+                    inputs,
+                    update_grid=update_grid_now,
+                    save_act=save_act)
                 loss = loss_fn(outputs, labels)
 
                 # Custom regularization loss
@@ -404,24 +414,31 @@ class LinearKAN(BaseKAN):
         optimizer,
         num_epochs=10,
         update_grid=True,
+        # save_act=True,
         device='cpu',
         l1_lambda=0.0,
         group_lambda=0.0,
         ortho_lambda=0.0,
         kan_lambda=0.0,
+        act_lambda=0.0
     ):
+        # Save activation values if activation regularization is enabled
+        save_act = act_lambda > 0
+
         losses = super().fit(
             train_loader,
             valid_loader,
-            loss_fn,
-            optimizer,
-            num_epochs,
-            update_grid,
-            device,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            num_epochs=num_epochs,
+            update_grid=update_grid,
+            save_act=save_act,
+            device=device,
             l1_lambda=l1_lambda,
             group_lambda=group_lambda,
             ortho_lambda=ortho_lambda,
             kan_lambda=kan_lambda,
+            act_lambda=act_lambda,
         )
         return losses
 
@@ -431,6 +448,7 @@ class LinearKAN(BaseKAN):
         group_lambda=0.0,
         ortho_lambda=0.0,
         kan_lambda=0.0,
+        act_lambda=0.0,
     ):
         # L1 regularization for all linear layers
         l1_reg = 0.0
@@ -457,12 +475,12 @@ class LinearKAN(BaseKAN):
             assert isinstance(layer, torch.nn.Linear)
             weights = layer.weight
 
-            # # 1) Strict, sensitive to the magnitude
+            # A) Strict, sensitive to the magnitude
             # wt_w = torch.mm(weights, weights.t())
             # identity = torch.eye(wt_w.size(0)).to(weights.device)
             # ortho_reg = torch.norm(wt_w - identity, p='fro')  # Frobenius
 
-            # 2) Focuses purely on the direction
+            # B) Focuses purely on the direction
             w_normalized = F.normalize(weights, p=2, dim=1)
             wt_w = torch.mm(w_normalized, w_normalized.t())
             mask = torch.eye(wt_w.size(0), device=weights.device)
@@ -479,4 +497,141 @@ class LinearKAN(BaseKAN):
                     kan_reg += layer.regularization_loss()
             kan_reg *= kan_lambda
 
-        return l1_reg + group_reg + ortho_reg + kan_reg
+        # Activation regularization
+        act_reg = 0.0
+        if act_lambda > 0:
+            assert len(self.activations) > 0, 'No activation values saved.'
+            layer_idx = 1 ### FIX: don't hard code
+            activations = self.activations[layer_idx]
+            num_features, batch_size = activations.shape
+
+            # 1a) l1 regularization on activations
+            # act_reg = torch.norm(activations, p=1) / batch_size
+
+            # 1b) l1 regularization on feature activations
+            feature_acts = torch.mean(activations, dim=0)
+            act_reg = torch.norm(feature_acts, p=1)  # / num_features
+
+            # 2) Diversity regularization
+            # cosine_sim = torch.matmul(activations.T, activations)
+            # cosine_sim.fill_diagonal_(0)  # Ignore self-similarity
+            # act_reg +=  torch.norm(cosine_sim, 1)
+
+            act_reg *= act_lambda
+
+        return l1_reg + group_reg + ortho_reg + kan_reg + act_reg
+
+
+class ConvKAN(BaseKAN):
+    '''
+    KAN with the first layer being a nn.Conv2d
+    '''
+    def __init__(
+        self,
+        width,
+        num_kernels,
+        kernel_size,
+        pool_size,
+        grid_size=3,
+        spline_order=3,
+        mult_arity=2,
+        scale_noise=0.1,
+        scale_base=0.0,
+        scale_spline=1.0,
+        base_fun='silu',
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+        seed=1,
+        # save_act=True,
+        device='cpu'
+    ):
+        super().__init__(
+            width=width,
+            grid_size=grid_size,
+            spline_order=spline_order,
+            mult_arity=mult_arity,
+            scale_noise=scale_noise,
+            scale_base=scale_base,
+            scale_spline=scale_spline,
+            base_fun=base_fun,
+            grid_eps=grid_eps,
+            grid_range=grid_range,
+            seed=seed,
+            device=device
+        )
+        self.num_kernels = num_kernels
+        self.kernel_size = kernel_size
+        self.pool_size = pool_size
+        self._create_layers()
+
+    def _create_layers(self):
+        # The first layer is a linear layer
+        l = 0
+        conv_layers = [
+            torch.nn.Conv1d(
+                in_channels=4,
+                out_channels=self.num_kernels,
+                kernel_size=self.kernel_size,
+                stride=1,
+                padding=0,
+                bias=True,
+                padding_mode='zeros'
+            ),
+            torch.nn.MaxPool1d(
+                kernel_size=self.pool_size
+            ),
+            torch.nn.ELU(alpha=1.0),
+            torch.nn.Flatten(),
+            torch.nn.LazyLinear(
+                out_features=self.width_out[l],
+                bias=True
+            )
+        ]
+        self.layers.extend(torch.nn.ModuleList(conv_layers))
+
+        # The rest of the layers are KAN layers
+        for l in range(0, self.depth):
+            self.layers.append(
+                KANLayer(
+                    in_features=self.width_in[l],
+                    out_features=self.width_out[l+1],
+                    grid_size=self.grid_size,
+                    spline_order=self.spline_order,
+                    scale_noise=self.scale_noise,
+                    scale_base=self.scale_base,
+                    scale_spline=self.scale_spline,
+                    base_activation=self.base_fun,
+                    grid_eps=self.grid_eps,
+                    grid_range=self.grid_range,
+                )
+            )
+
+    def fit(
+        self,
+        train_loader,
+        valid_loader,
+        loss_fn,
+        optimizer,
+        num_epochs=10,
+        update_grid=True,
+        device='cpu',
+    ):
+        losses = super().fit(
+            train_loader,
+            valid_loader,
+            loss_fn,
+            optimizer,
+            num_epochs,
+            update_grid,
+            device
+        )
+        return losses
+
+    def forward(self, x: torch.Tensor, update_grid=False):
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, KANLayer) and update_grid:
+                layer.update_grid(x)
+            if i == 0: # Convolutional layer
+                x = x.permute(0, 2, 1)
+            x = layer(x)
+        return x
